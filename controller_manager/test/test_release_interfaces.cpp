@@ -426,3 +426,69 @@ TEST_F(TestReleaseExclusiveInterfaces, test_exclusive_interface_switching_failur
       abstract_test_controller2.c->get_lifecycle_state().id());
   }
 }
+
+TEST_F(TestReleaseInterfaces, shutdown_controllers_during_update)
+{
+  std::string controller_type =
+    test_controller_with_interfaces::TEST_CONTROLLER_WITH_INTERFACES_CLASS_NAME;
+  std::string controller_name = "test_controller1";
+
+  ASSERT_NO_THROW(cm_->load_controller(controller_name, controller_type));
+  ASSERT_EQ(1u, cm_->get_loaded_controllers().size());
+  controller_manager::ControllerSpec abstract_test_controller = cm_->get_loaded_controllers()[0];
+
+  ASSERT_EQ(controller_interface::return_type::OK, cm_->configure_controller(controller_name));
+
+  std::vector<std::string> start_controllers = {controller_name};
+  std::vector<std::string> stop_controllers = {};
+  auto switch_future = std::async(
+    std::launch::async, &controller_manager::ControllerManager::switch_controller, cm_,
+    start_controllers, stop_controllers, STRICT, true, rclcpp::Duration(0, 0));
+  ASSERT_EQ(std::future_status::timeout, switch_future.wait_for(std::chrono::milliseconds(100)))
+    << "switch_controller should be blocking until next update cycle";
+  ControllerManagerRunner cm_runner(this);
+  EXPECT_EQ(controller_interface::return_type::OK, switch_future.get());
+  ASSERT_EQ(
+    lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE,
+    abstract_test_controller.c->get_lifecycle_state().id());
+
+  // Run concurrent update loop in another thread to simulate RT thread during shutdown
+  std::atomic<bool> run_loop{true};
+  std::atomic<int> update_counter{0};
+  std::thread rt_thread(
+    [&]()
+    {
+      while (run_loop && !cm_->is_shutting_down())
+      {
+        cm_->read(time_, PERIOD);
+        cm_->update(time_, PERIOD);
+        cm_->write(time_, PERIOD);
+        update_counter++;
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    });
+
+  // Let RT loop run for a few cycles
+  while (update_counter.load() < 5)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // Trigger shutdown while update loop is actively executing
+  EXPECT_FALSE(cm_->is_shutting_down());
+  EXPECT_TRUE(cm_->shutdown_controllers());
+  EXPECT_TRUE(cm_->is_shutting_down());
+
+  run_loop = false;
+  if (rt_thread.joinable())
+  {
+    rt_thread.join();
+  }
+
+  EXPECT_EQ(
+    lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED,
+    abstract_test_controller.c->get_lifecycle_state().id());
+
+  // Subsequent update calls should return OK without attempting to run finalized controller
+  EXPECT_EQ(controller_interface::return_type::OK, cm_->update(time_, PERIOD));
+}

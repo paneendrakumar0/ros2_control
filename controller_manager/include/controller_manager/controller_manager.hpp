@@ -233,6 +233,13 @@ public:
     return resource_manager_ && resource_manager_->are_components_initialized();
   }
 
+  /// Check if the controller manager is shutting down.
+  /**
+   * Checks if shutdown has been requested or initiated.
+   * \returns true if shutting down, false otherwise.
+   */
+  bool is_shutting_down() const { return is_shutting_down_.load(std::memory_order_acquire); }
+
   /// Update rate of the main control loop in the controller manager.
   /**
    * Update rate of the main control loop in the controller manager.
@@ -675,6 +682,8 @@ private:
   bool use_sim_time_;
   rclcpp::Clock::SharedPtr trigger_clock_ = nullptr;
   std::unique_ptr<rclcpp::PreShutdownCallbackHandle> preshutdown_cb_handle_{nullptr};
+  std::atomic<bool> is_shutting_down_{false};
+  std::atomic<bool> rt_update_active_{false};
   RTControllerListWrapper rt_controllers_wrapper_;
   std::unordered_map<std::string, ControllerChainSpec> controller_chain_spec_;
   std::vector<std::string> ordered_controllers_names_;
