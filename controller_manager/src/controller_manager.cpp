@@ -639,22 +639,25 @@ bool ControllerManager::shutdown_controllers()
   RCLCPP_INFO(get_logger(), "Shutting down all controllers in the controller manager.");
   is_shutting_down_.store(true, std::memory_order_release);
 
-  // Wait for any active RT update cycle to finish before releasing interfaces
-  const auto start_wait = std::chrono::steady_clock::now();
-  while (rt_update_active_.load(std::memory_order_acquire))
-  {
-    if (std::chrono::steady_clock::now() - start_wait > std::chrono::milliseconds(250))
-    {
-      RCLCPP_WARN(get_logger(), "Timeout waiting for active RT update cycle during shutdown");
-      break;
-    }
-    std::this_thread::yield();
-  }
-
   // Shutdown all controllers
   std::lock_guard<RTControllerListWrapper::controllers_lock_type> guard(
     rt_controllers_wrapper_.controllers_lock_);
   std::vector<ControllerSpec> controllers_list = rt_controllers_wrapper_.get_updated_list(guard);
+
+  // Hand the RT thread an empty controller list and wait until it has left the old one, so that
+  // deactivating and releasing interfaces below cannot race with an in-flight update().
+  try
+  {
+    rt_controllers_wrapper_.get_unused_list(guard).clear();
+    rt_controllers_wrapper_.switch_updated_list(guard);
+  }
+  catch (const std::runtime_error & e)
+  {
+    // Raised when rclcpp is interrupted while waiting; still shut down on a best-effort basis
+    RCLCPP_ERROR(
+      get_logger(), "Could not make sure the RT thread stopped using the controllers: %s",
+      e.what());
+  }
   bool ctrls_shutdown_status = true;
   for (auto & controller : controllers_list)
   {
@@ -682,7 +685,6 @@ bool ControllerManager::shutdown_controllers()
 void ControllerManager::init_controller_manager()
 {
   is_shutting_down_.store(false, std::memory_order_release);
-  rt_update_active_.store(false, std::memory_order_release);
 
   // Initialized activity publisher and diagnostics
   controller_manager_activity_publisher_ =
@@ -3408,26 +3410,6 @@ void ControllerManager::manage_switch()
 controller_interface::return_type ControllerManager::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
-  if (is_shutting_down_.load(std::memory_order_acquire))
-  {
-    return controller_interface::return_type::OK;
-  }
-
-  struct RTActiveGuard
-  {
-    std::atomic<bool> & flag;
-    explicit RTActiveGuard(std::atomic<bool> & f) : flag(f)
-    {
-      flag.store(true, std::memory_order_release);
-    }
-    ~RTActiveGuard() { flag.store(false, std::memory_order_release); }
-  } guard(rt_update_active_);
-
-  if (is_shutting_down_.load(std::memory_order_acquire))
-  {
-    return controller_interface::return_type::OK;
-  }
-
   const auto start_time = std::chrono::steady_clock::now();
   execution_time_.switch_time = 0.0;
   execution_time_.switch_chained_mode_time = 0.0;
