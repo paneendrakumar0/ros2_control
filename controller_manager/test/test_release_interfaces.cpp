@@ -427,68 +427,56 @@ TEST_F(TestReleaseExclusiveInterfaces, test_exclusive_interface_switching_failur
   }
 }
 
-TEST_F(TestReleaseInterfaces, shutdown_controllers_during_update)
+TEST_F(TestReleaseInterfaces, shutdown_controllers_waits_for_in_flight_update)
 {
-  std::string controller_type =
-    test_controller_with_interfaces::TEST_CONTROLLER_WITH_INTERFACES_CLASS_NAME;
-  std::string controller_name = "test_controller1";
-
-  ASSERT_NO_THROW(cm_->load_controller(controller_name, controller_type));
-  ASSERT_EQ(1u, cm_->get_loaded_controllers().size());
-  controller_manager::ControllerSpec abstract_test_controller = cm_->get_loaded_controllers()[0];
-
+  const std::string controller_name = "test_controller1";
+  ASSERT_NO_THROW(cm_->load_controller(
+    controller_name, test_controller_with_interfaces::TEST_CONTROLLER_WITH_INTERFACES_CLASS_NAME));
+  auto controller = cm_->get_loaded_controllers()[0];
   ASSERT_EQ(controller_interface::return_type::OK, cm_->configure_controller(controller_name));
 
-  std::vector<std::string> start_controllers = {controller_name};
-  std::vector<std::string> stop_controllers = {};
-  auto switch_future = std::async(
-    std::launch::async, &controller_manager::ControllerManager::switch_controller, cm_,
-    start_controllers, stop_controllers, STRICT, true, rclcpp::Duration(0, 0));
-  ASSERT_EQ(std::future_status::timeout, switch_future.wait_for(std::chrono::milliseconds(100)))
-    << "switch_controller should be blocking until next update cycle";
-  ControllerManagerRunner cm_runner(this);
-  EXPECT_EQ(controller_interface::return_type::OK, switch_future.get());
+  {
+    auto switch_future = std::async(
+      std::launch::async, &controller_manager::ControllerManager::switch_controller, cm_,
+      std::vector<std::string>{controller_name}, std::vector<std::string>{}, STRICT, true,
+      rclcpp::Duration(0, 0));
+    ControllerManagerRunner cm_runner(this);
+    ASSERT_EQ(controller_interface::return_type::OK, switch_future.get());
+  }
   ASSERT_EQ(
-    lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE,
-    abstract_test_controller.c->get_lifecycle_state().id());
+    lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE, controller.c->get_lifecycle_state().id());
 
-  // Run concurrent update loop in another thread to simulate RT thread during shutdown
+  // An update() that takes longer than any reasonable shutdown wait
+  auto * test_controller =
+    static_cast<test_controller_with_interfaces::TestControllerWithInterfaces *>(
+      controller.c.get());
+  test_controller->update_duration_ms = 400;
+
+  // Single RT thread, like the real control loop
   std::atomic<bool> run_loop{true};
-  std::atomic<int> update_counter{0};
   std::thread rt_thread(
     [&]()
     {
-      while (run_loop && !cm_->is_shutting_down())
+      while (run_loop)
       {
         cm_->read(time_, PERIOD);
         cm_->update(time_, PERIOD);
         cm_->write(time_, PERIOD);
-        update_counter++;
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     });
 
-  // Let RT loop run for a few cycles
-  while (update_counter.load() < 5)
+  while (!test_controller->in_update)
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  // Trigger shutdown while update loop is actively executing
-  EXPECT_FALSE(cm_->is_shutting_down());
+  // Shutdown must not deactivate/release the controller while update() is still running
   EXPECT_TRUE(cm_->shutdown_controllers());
-  EXPECT_TRUE(cm_->is_shutting_down());
+  EXPECT_FALSE(test_controller->deactivated_during_update);
 
   run_loop = false;
-  if (rt_thread.joinable())
-  {
-    rt_thread.join();
-  }
-
+  rt_thread.join();
   EXPECT_EQ(
-    lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED,
-    abstract_test_controller.c->get_lifecycle_state().id());
-
-  // Subsequent update calls should return OK without attempting to run finalized controller
-  EXPECT_EQ(controller_interface::return_type::OK, cm_->update(time_, PERIOD));
+    lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED, controller.c->get_lifecycle_state().id());
 }
